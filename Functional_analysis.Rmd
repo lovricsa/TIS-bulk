@@ -1,0 +1,234 @@
+---
+title: "Functional analysis of the Senescence project (builds upon results in Bulk DE analysis)"
+date: "`r Sys.Date()`"
+author: "Anna Lovrics"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: yes
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+---
+
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warnings=FALSE, fig.width=12, fig.height=5)
+```
+
+
+```{r libraries}
+
+# replace with new packages!!!
+# install CRAN packages via BioConductor as well
+if (!"BiocManager" %in% installed.packages()[,"Package"]){
+  install.packages("BiocManager")
+}
+list.of.packages <- c("ggplot2", "limma", "dplyr", "tidyr", "openxlsx", 
+                      "fgsea", "msigdbr", "stringr")
+new.packages <- setdiff(list.of.packages, installed.packages()[,"Package"])
+if(length(new.packages)) BiocManager::install(new.packages)
+
+library(ggplot2) # for nice plots
+library(limma) # for the diff expression analysis
+library(dplyr) # to work with tibbles & other data management
+library(tidyr) # for data manipulation
+library(openxlsx) # to read and write data from/to xlsx files
+library(fgsea)
+library(msigdbr) # for the gene sets
+library(stringr) # for str_wrap
+```
+
+```{r folder structure}
+# set the  working directory the directory you launched R from
+setwd(Sys.getenv("PWD")) 
+mainfolder <- getwd()
+datafolder <- file.path(mainfolder, "Data")
+calcfolder <- file.path(mainfolder, "Data_calculated")
+figfolder <- file.path(mainfolder, "Figures")
+resfolder <- file.path(mainfolder, "Results")
+```
+
+
+```{r read in normalised expression and gene annotation}
+# read in differential expression result
+outfile <- file.path(resfolder, "limma_fit_diffexpr.rds")
+fite <- readRDS(file=outfile)
+
+infile <- file.path(datafolder, "Samples/gene_annotation.csv")
+genes_annot <- read.delim(infile,sep="\t")[,c('Gene_ID', 'name', 'description')]
+genes_annot$label <- ifelse(genes_annot$name == "None", 
+                            genes_annot$Gene_ID,
+                            genes_annot$name)
+```
+
+Select contrasts: TIS vs CTR, REPOP vs TIS in the malignant cell lines and TIS vs CTR in HFF cells
+```{r create list of ranks using logFC (instead of p.adjust as before)}
+mcf_vector <- c("control2senescent_mal", "senescent2repopulated_mal",
+                 "control2senescent_HFF")
+toptt_orig <- list()
+toptt_ranks <- list()
+#postfix <- "padj"
+postfix <- "logFC"
+for (mcf in mcf_vector){
+  toptt_orig[[mcf]] <- topTable(fite, coef=mcf,  
+                    number=nrow(fite$coefficients), sort.by = "none")
+  if (postfix == "logFC"){
+    toptt_ranks[[mcf]] <- toptt_orig[[mcf]]$logFC
+    toptt_ranks[[mcf]] <- as.vector(scale(toptt_ranks[[mcf]], center=T, scale=F))
+  }
+ if (postfix == "padj"){
+    toptt_ranks[[mcf]] <- -log10(toptt_orig[[mcf]]$adj.P.Val)*sign(toptt_orig[[mcf]]$logFC)
+  }
+  names(toptt_ranks[[mcf]]) <- rownames(toptt_orig[[mcf]])
+}
+```
+
+GSEA analysis for the contrasts with selected gene sets
+```{r GSEA analysis}
+# selected gene sets (GO:BP, CP:KEGG, hallmark)
+category_names <- c("C5", "C2", "H")
+subcategory_names <- c("GO:BP","CP:KEGG", "")
+prefix <- c("gobp_", "kegg_", "hallmark_")
+# repeat for different coefficients
+FA_lists <- list()
+for (mcf in mcf_vector){
+  folderFA <-  file.path(resfolder, 
+                 paste("FA", mcf, postfix, sep="_"))
+  if (!file.exists(folderFA)) dir.create(folderFA)
+  geneset_file <- file.path(folderFA, "GO_category_enrichments.rds")
+  if (file.exists(geneset_file)){
+    FA_lists[[mcf]] <- readRDS(geneset_file)
+  } else {
+  # repeat for different gene sets
+  for (gsi in c(1:length(category_names))){
+  #for (gsi in c(1:1)){
+    broad_name <- subcategory_names[gsi]
+    folder_name <- ifelse(nchar(broad_name) > 0, broad_name, category_names[gsi])
+    # create a folder
+    folderenrres <- file.path(folderFA, folder_name)
+    if (!file.exists(folderenrres)) dir.create(folderenrres)
+    # use the actual genesets
+    GO_db <- msigdbr(species= "Homo sapiens",
+                     category=category_names[gsi], subcategory = subcategory_names[gsi])
+    GO_db_list <- unique(GO_db[, c("ensembl_gene","gs_name")])
+    GO_db_list <- split(x=GO_db_list$ensembl_gene, f=GO_db_list$gs_name)
+    print(paste("GO_db_list ", folder_name, " created", sep = ""))
+    # remove genes not in universe
+    for (gsname in names(GO_db_list)){
+      # keepgene <- which(GO_db_list[[gsname]] %in% names(fite$Amean))
+      keepgene <- which(GO_db_list[[gsname]] %in% rownames(toptt_orig[[mcf]]))
+      GO_db_list[[gsname]] <- GO_db_list[[gsname]][keepgene]
+    }
+    # now the gene enrichment analysis
+    # genes_universe <- names(fite$Amean)
+    genes_universe <- rownames(toptt_orig[[mcf]])
+    set.seed(99)
+    system.time( # keep track of elapsed time
+      fgsea_res <- fgseaMultilevel(pathways = GO_db_list,
+                                   stats = toptt_ranks[[mcf]], 
+                                   minSize = 0, 
+                                   maxSize = 500, 
+                                   eps = 0, 
+                                   nPermSimple = 50000)
+    )
+    fgsea_res <- arrange(fgsea_res, -NES)
+    # remove na rows
+    omit <- which(is.na(fgsea_res$pval))
+    if (length(omit) > 0) fgsea_res <- fgsea_res[-omit,]
+    # write out leading edge genes
+    fgsea_res$leadingSymbols <- fgsea_res$leadingEdge
+    for (ri in 1:nrow(fgsea_res)){
+      gsymbols <- genes_annot[match(fgsea_res$leadingEdge[[ri]], genes_annot$Gene_ID),"label"]
+      fgsea_res$leadingEdge[[ri]] <- gsymbols
+    }
+    
+    # add number of leading edge genes
+    fgsea_res$count = lengths(fgsea_res$leadingEdge)
+    
+    # add gene ratio & background ratio 
+    Nval <- nrow(fite$coefficients)
+    nval <- length(which(toptt_orig[[mcf]]$adj.P.Val<=0.05 & 
+                           toptt_orig[[mcf]]$logFC>=1))
+    fgsea_res$GeneRatio <- fgsea_res$count/nval
+    fgsea_res$BgRatio <- fgsea_res$size/Nval
+    
+    # write to file
+    outfile <- file.path(folderenrres, 
+                        paste("enriched_genesets_fgsea_", mcf, ".xlsx", sep=""))
+    write.xlsx(fgsea_res, file = outfile, colNames=T, rowNames=F)
+    
+    # put into the list
+    FA_lists[[mcf]][[folder_name]] <- fgsea_res
+  } # repeated for different gene sets
+    saveRDS(FA_lists[[mcf]], file=geneset_file)
+  } # end for check whether geneset_file exists
+} # end of loop for different contrasts (ctr2sen_mal, sen2repop_mal, ctr2sen_HFF)
+
+```
+
+# Visual representation of gene set enrichment results of "H", GO:BP and KEGG pathways. Included graphics for Figure 4 L, M (dotplots for contrasts TIS vs CTR and REPOP vs TIS in malignant cells for hallmark gene sets), Supplementary Figure S3E (dotplot for contrast TIS vs CTR in HFF for hallmark gene sets), Figure S3F (dotplot for contrast TIS vs CTR in malignant cells for KEGG gene sets), Figure S3G (dotplot for contrast TIS vs CTR in HFF for KEGG gene sets)
+```{r dotplot for selected gene sets}
+for (mcf in mcf_vector){
+  geneset_file <- file.path(folderFA, "GO_category_enrichments.rds")
+  for (gsi in c(1:length(category_names))){
+    y <- FA_lists[[mcf]][[gsi]]
+    
+    # select activated and supressed genesets
+    y$direction <- "activated"
+    y$direction[y$NES<=0] <- "suppressed"
+    numact <- length(which(y$direction=="activated"))
+    numsupp <- length(which(y$direction=="suppressed"))
+
+    # pick top and bottom genesets
+    act_Nvals <- y$NES[y$direction=="activated"]
+    act_thr <- sort(act_Nvals, decreasing = T)[min(10, numact)]
+    act_keep <- which(y$direction=="activated" & y$NES >= act_thr)
+    sup_Nvals <- y$NES[y$direction=="suppressed"]
+    sup_thr <- sort(sup_Nvals, decreasing = F)[min(10, numsupp)]
+    sup_keep <- which(y$direction=="suppressed" & y$NES <= sup_thr)
+    y <- y[c(act_keep, sup_keep),]
+    
+    # sort by normalized enrichment
+    y <- y[order(y$NES, decreasing = F),]
+    # change the names of the gene sets
+    y$pathway <- tolower(y$pathway)
+    y$pathway <- gsub(prefix[gsi], "", y$pathway)
+    y$pathway <- gsub("_", " ", y$pathway)
+    y$pathway <- str_to_sentence(y$pathway)
+    y$pathway <- gsub("dna", "DNA", y$pathway)
+    y$pathway <- gsub("Dna", "DNA", y$pathway)
+    #y$pathway <- nice_names$name[match(y$pathway, nice_names$compare)]
+    
+    y$pathway <- factor(y$pathway, levels=y$pathway)
+    
+     # plot together
+      p <- ggplot(y, 
+                    aes(x = NES, y = pathway)) + 
+               geom_point(aes(size = count, color = padj)) +
+               guides(size=guide_legend(title="Count", ncol=1,byrow=TRUE,
+                                title.vjust=0.9, order=1))+
+               theme_bw(base_size = 12) +
+               scale_color_continuous(low="red", high="blue", name = "p.adjust",
+                     guide=guide_colorbar(reverse=TRUE))+
+               theme(legend.position="right", 
+                      legend.box = "vertical",
+                     #axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1),
+                     #strip.background =element_rect(fill=cfill),
+                     strip.text = element_text(colour = 'black'))+
+               ylab(NULL) + xlab("NES")+ 
+               scale_size(range=c(3, 8))+
+               #scale_y_discrete(labels = function(x) str_wrap(x, width = 24))+
+               geom_vline(xintercept = 0, linetype="dashed")
+    figfile <- file.path(figfolder, paste(mcf, '_',
+           names(FA_lists[[mcf]])[gsi], '_', postfix, '_', 'both',
+           "_enrich_dotplot.pdf", sep=""))
+    ggsave(figfile, plot=p, width=7, height=6)
+
+  }
+}
+
+```

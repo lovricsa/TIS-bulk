@@ -1,0 +1,1026 @@
+---
+title: "Bulk differential expression analysis of 'Therapy-induced senescence is a drug resistance mechanism in breast cancer' manuscript"
+date: "`r Sys.Date()`"
+author: "Anna Lovrics"
+output:
+  html_document:
+    css: assets/rany_style.css
+    df_print: paged
+    highlight: tango
+    theme: cosmo
+    toc: yes
+    toc_float:
+      collapsed: true
+    number_sections: true
+    code_folding: hide
+---
+
+
+```{r setup, include=F}
+knitr::opts_chunk$set(message=FALSE, warnings=FALSE, fig.width=12, fig.height=5)
+```
+
+The code is under GNU GPL-3 license (https://www.gnu.org/licenses/gpl-3.0.html).
+
+The objective of this R Markdown code is to reproduce bulk RNA-seq analysis
+in the publication Bajtai et al.: Therapy-induced senescence is a drug resistance mechanism in breast cancer
+
+```{r libraries}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+# install CRAN packages via BioConductor as well
+if (!"BiocManager" %in% installed.packages()[,"Package"]){
+  install.packages("BiocManager")
+}
+list.of.packages <- c("ggplot2", "ComplexHeatmap", "tidyHeatmap", 
+                      "circlize", "limma", "edgeR", "dplyr", "tidyr",
+                      "UpSetR", "ComplexUpset", "readr", "openxlsx", "readxl", 
+                      "ggmagnify", "readr", "ggrepel")
+new.packages <- setdiff(list.of.packages, installed.packages()[,"Package"])
+if(length(new.packages)) BiocManager::install(new.packages)
+
+library(ggplot2) # for nice plots
+library(ComplexHeatmap) # for complex heatmap
+library(tidyHeatmap) # to save the plot obtained from ComplexHeatmap
+library(circlize) # here needed for the colorRamp function
+# library(gplots) # for heatmap.2
+library(limma) # for the diff expression analysis
+library(edgeR) # needed for limma analysis: create DGEList object from a table of count
+library(dplyr) # to work with tibbles & other data management
+library(tidyr) # for data manipulation
+library(UpSetR) # alternative to Venn diagrams
+library(ComplexUpset) # for more complex upset diagrams
+library(openxlsx) # to read and write data from/to xlsx files
+library(readxl) # another package to read excel files
+library(ggmagnify) # to magnify an inset in ggplot
+library(ggrepel)
+library(readr) # for write_csv
+```
+
+```{r folder structure}
+# knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+# set the  working directory the directory you launched R from
+setwd(Sys.getenv("PWD")) 
+mainfolder <- getwd()
+datafolder <- file.path(mainfolder, "Data")
+calcfolder <- file.path(mainfolder, "Data_calculated")
+if (!file.exists(calcfolder)) dir.create(calcfolder)
+figfolder <- file.path(mainfolder, "Figures")
+if (!file.exists(figfolder)) dir.create(figfolder)
+resfolder <- file.path(mainfolder, "Results")
+if (!file.exists(resfolder)) dir.create(resfolder)
+
+# read in utility functions
+source(file.path(mainfolder, "utils.R"))
+```
+
+# Input for differential analysis is the count matrix, samples annotation and the design table. Gene annotation is also provided.
+```{r read in input data}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+infile <- file.path(datafolder, "Counts/count_matrix.txt")
+indata <- read.table(infile, header=T, sep="\t", quote="\"",
+                     comment.char="#", stringsAsFactors=FALSE,
+                     fill=FALSE, na.strings=".", blank.lines.skip=T,
+                     check.names = F, row.names = 1)
+design_file <- file.path(datafolder, "Samples/design.csv")
+design_limma <- read.table(design_file, sep="\t", header=T, row.names = 1)
+design_limma <- design_limma[c(2:nrow(design_limma)),]
+rownames_limma <- paste("ELTE.TTK.Onko.", design_limma[,1], sep="")
+design_limma <- design_limma[, c(2:ncol(design_limma))]
+rownames(design_limma) <- rownames_limma
+for (ci in 1:ncol(design_limma)){
+  design_limma[,ci] <- as.numeric(design_limma[,ci])
+}
+design_limma <- as.matrix(design_limma)
+
+# la2change - this file needs to be change to reflect the final sample names
+annot_file <- file.path(datafolder, "Samples/samples_annot_long.csv")
+samples_annot <- read.csv(annot_file)
+samples_annot_short <- samples_annot[!duplicated(samples_annot$group),]
+
+infile <- file.path(datafolder, "Samples/gene_annotation.csv")
+genes_annot <- read.delim(infile,sep="\t")[,c('Gene_ID', 'name', 'description')]
+genes_annot$label <- ifelse(genes_annot$name == "None", 
+                            genes_annot$Gene_ID,
+                            genes_annot$name)
+```
+
+Calculate and save normalised expression.
+```{r calculate normalised expression}
+# place data into a DGElist object
+dge_all <- edgeR::DGEList(counts = indata)
+# #Determine which genes have sufficiently large counts to be retained in a statistical analysis.
+keep <- filterByExpr(dge_all, design_limma)
+# recalculate the library sizes of your samples after filtering
+dge_filtered <- dge_all[keep,,keep.lib.sizes=FALSE]
+## Library Size Normalization
+dge_norm <- calcNormFactors(dge_filtered)
+# Transform count data to log2-counts per million (logCPM) - Ready for Linear Modelling
+v1 <- voom(dge_norm, design_limma, plot=F)
+# save & plot intermediate results
+exprmx <- as_tibble(v1$E, rownames = "GeneID")
+# add human readable column names 
+colnames(exprmx)[2:ncol(exprmx)] <- samples_annot$sample_full[
+                  match(colnames(exprmx)[2:ncol(exprmx)], samples_annot$fname)]
+tmpfile <- file.path(calcfolder, "edgeR_normcounts.txt")
+write.table(exprmx, file=tmpfile, sep="\t", row.names = F)
+```
+
+Create a boxplot of normalised expressions (Figure 4B).
+```{r plot normalised expression of samples}
+# for the boxplot, create a long tibble first
+exprmx_long <- pivot_longer(exprmx, !GeneID,
+                            names_to = "cell_trt", 
+                            values_to = "gene_expr")
+exprmx_long$cell <- samples_annot$cell[match(exprmx_long$cell_trt, 
+                                             samples_annot$sample_full)]
+exprmx_long$treatment <- samples_annot$treatment[match(exprmx_long$cell_trt, 
+                                             samples_annot$sample_full)]
+# plot malignant cell types only & in the given order for cells and treatments
+exprmx_long <- exprmx_long[!exprmx_long$cell=="HFF",]
+cell_order <- c("MCF7", "T47D", "MDA-MB-231", "Hs578T")
+exprmx_long$cell <- factor(exprmx_long$cell, levels=cell_order)
+treat_order <- c("control", "senescent", "repopulated")
+exprmx_long$treatment <- factor(exprmx_long$treatment, levels=treat_order)
+
+p <- ggplot(exprmx_long, aes(x=cell, y=gene_expr, fill=treatment)) + 
+       geom_boxplot()+
+       #ylab("log2 normalized gene expression") + xlab("")+
+       ylab(bquote(Log[2] * bgroup("(", "normalized gene expression", ")" )))+
+       xlab("")+
+      theme_gray(base_size = 20)+
+      # replace fill scale values
+      scale_fill_discrete("treatment", 
+                      #labels=c("control", "senescent", "repopulated"))
+                      labels=c("CTR", "TIS", "REPOP"))
+
+plot(p)
+# also save the plot
+figfile <- file.path(figfolder, "boxplot_normalized.pdf")
+ggsave(figfile, height=7, width=10)
+```
+
+PCA of malignant samples (Figure 4C).
+```{r PCA analysis of the malignant samples}
+keep_cols <- which(grepl("MCF7|T47D|231|Hs", colnames(exprmx)))
+indata_mx <- as.matrix(exprmx[,keep_cols])
+pca <- prcomp(t(indata_mx), center=TRUE, scale=FALSE,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+# files scree plot
+pca.var <- pca$sdev^2
+pca.var.per <- round(pca.var/sum(pca.var)*100, 1)
+
+sumvar <- 0
+for (pcind in 1:length(pca.var)){
+  sumvar <- sumvar + pca.var.per[pcind]
+  if (sumvar > 95){
+    maxi <- pcind
+    #print(maxi)
+    break
+  }
+}
+vardf <- as.data.frame(cbind('PC'=1:maxi, 'variance'=pca.var.per[1:maxi]))
+
+p <- ggplot(data=vardf) + 
+  geom_col(mapping=aes(x=PC, y=cumsum(variance)))+
+  xlab("Principal Component") +  ylab("Cumulative percent variation") +
+  geom_hline(yintercept=95, linetype="dashed", 
+             color = "red", linewidth=1)
+# plot(p)
+
+# now plot a PCA plot with annotation
+pca_res <- as_tibble(pca$x, rownames = "sample")
+# pca_res$sample[46:90] <- strsplit2(pca_res$sample[46:90, drop=T], "_")[,1]
+# pca_res$analysis <- annot_double$analysis
+pca_annot <- inner_join(pca_res, samples_annot, by=c("sample"="sample_full"))
+pca_annot$treatment <- factor(pca_annot$treatment, levels=treat_order)
+
+nicexlabel <- paste('PC1 (', as.character(vardf$variance[1]), '%)', sep="")
+niceylabel <- paste('PC2 (', as.character(vardf$variance[2]), '%)', sep="")
+nicezlabel <- paste('PC3 (', as.character(vardf$variance[3]), '%)', sep="")
+
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, 
+                         col = cell, shape = treatment), 
+             size = 3, stroke = 2, fill="white")+
+  scale_shape_manual(values = c(21,22,23),
+                      labels=c("CTR", "TIS", "REPOP"))+
+  scale_color_manual(values=c("MCF7"="red", "T47D"="orange", 
+                              "MDA-MB-231"="darkblue", "Hs578T"="darkgreen"))+
+   labs(x = nicexlabel, y = niceylabel)+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+plot(p)
+resfile <- file.path(figfolder, "PCA_samples_PC1_vs_PC2.pdf")
+ggsave(resfile, plot=p, width=7, height=5)
+```
+
+Calculate the differential gene expression and save the results.
+```{r calculate differential gene expression}
+fit <- lmFit(v1$E[, match(rownames(design_limma),colnames(v1$E))], 
+             design=design_limma)
+# save result for further use
+outfile <- file.path(resfolder, "limma_fit_expr.rds")
+saveRDS(fit, file=outfile)
+
+# also write to file
+gene_expr_average <- fit$coefficients
+colnames(gene_expr_average) <- samples_annot_short[match(
+              colnames(gene_expr_average), samples_annot_short$groupID), "group", drop=T]
+gene_expr_average <- as_tibble(gene_expr_average, rownames="Gene_ID")
+# put into a list
+exprout <- list()
+# add gene & sample annotation
+exprout[["mean"]]  <- genes_annot[match(gene_expr_average$Gene_ID,
+                                        genes_annot$Gene_ID),1:3]
+# add average gene expression
+exprout[["mean"]]  <- left_join(exprout[["mean"]] ,  
+                                gene_expr_average, by="Gene_ID")
+outfile <- file.path(resfolder, "logCPM_mean.xlsx")
+write.xlsx(exprout[["mean"]] , file=outfile)
+
+# contrasts are read from file
+contr_file <- file.path(datafolder, "Samples/contrasts_final.csv")
+contr_expr <- read.table(contr_file, sep=";")
+contr.matrix <- makeContrasts(contrasts=contr_expr$V2, levels=colnames(design_limma))
+colnames(contr.matrix) <- contr_expr$V1
+
+fitc <- contrasts.fit(fit, contr.matrix)
+fite <- eBayes(fitc) ## gives moderated t-statistics
+# save result for further use
+outfile <- file.path(resfolder, "limma_fit_diffexpr.rds")
+saveRDS(fite, file=outfile)
+
+# also write out to human readable file
+lthr <- 1; pthr <- 0.05
+thrchar <- paste(sprintf("lfc%01d", lthr), 
+                   sprintf("adjp%.2f", pthr), sep="_")
+outdata <- list()
+outdata_signif <- list() # only write out genes whose diff expr is signif
+for (cf in colnames(fite$coefficients)){
+  toptt <- limma::topTable(fite, coef=cf, sort.by = "logFC",
+          number=nrow(fite$coefficients))
+  toptt <- as_tibble(toptt, rownames = "Gene_ID")
+  # add annotation
+  toptt <- left_join(toptt, genes_annot[, c(1:3)], by="Gene_ID")
+  lname <- substr(cf,1, min(nchar(cf), 31)) # for each tab name, a maximum of 31 length is allowed
+  outdata[[lname]] <- toptt
+
+  # repeat with significant genes only
+  toptt_thr <- limma::topTable(fite, coef=cf, sort.by = "logFC",
+                p.value=pthr, lfc=lthr, number=nrow(fite$coefficients))
+  toptt_thr <- as_tibble(toptt_thr, rownames = "Gene_ID")
+  # add annotation
+  toptt_thr <- left_join(toptt_thr, genes_annot[, c(1:3)], by="Gene_ID")
+  outdata_signif[[lname]] <- toptt_thr
+}
+# write into a compound excel file
+outfile <- file.path(resfolder, "diffexpr_all.xlsx")
+write.xlsx(outdata, file = outfile, colNames=T, rowNames=F)
+outfile_signif <- outfile <- file.path(resfolder, 
+                     paste("diffexpr_", thrchar, "_signif.xlsx", sep=""))
+write.xlsx(outdata_signif, file = outfile_signif, colNames=T, rowNames=F)
+```
+
+Create a list of significantly up- and downregulated genes.
+```{r create a list of siginficantly up- and downregulated genes}
+# use upsetR to show overlaps between sets
+lthr <- 1; pthr <- 0.05
+signif_diff <- list()
+for (cf in colnames(fite$contrasts)){
+  toptt <- topTable(fite, coef=cf,  
+                    number=nrow(fite$coefficients), sort.by = "none",
+                    p.value=pthr, lfc = lthr)
+  name_up <- paste(cf,"up", sep="_")
+  signif_diff[[name_up]] <- rownames(toptt)[toptt$logFC>0]
+  name_down <- paste(cf, "down", sep="_")
+  signif_diff[[name_down]] <- rownames(toptt)[toptt$logFC<0]
+}
+# number of genes
+setsizes <- unlist(lapply(signif_diff, length))
+```
+
+Plot the upset diagrams of significantly differentially expressed genes (Figure 4D-I).
+```{r plot upset diagrams using the new layout}
+plot_upset_newlayout(signif_diff,  diff_name="control2senescent", direction="up")
+plot_upset_newlayout(signif_diff,  diff_name="control2senescent", direction="down")
+plot_upset_newlayout(signif_diff,  diff_name="control2repopulated", direction="up", xxmin=10, xxmax=14)
+plot_upset_newlayout(signif_diff,  diff_name="control2repopulated", direction="down", xxmin=8, xxmax=12)
+plot_upset_newlayout(signif_diff,  diff_name="senescent2repopulated", direction="up")
+plot_upset_newlayout(signif_diff,  diff_name="senescent2repopulated", direction="down")
+
+```
+
+Heatmap of differentially expressed genes that are i) both upregulated during CTR to TIS transition and downregulated during TIS to REPOP transition or ii) both downregulated during CTR to TIS transition and upnregulated during TIS to REPOP transition (Supplementary Figure S4A).
+```{r plot heatmap using the differentially expressed genes only}
+# select genes, that are differentially expressed in all malignant cell types
+# up in ctr2sen & down in sen2repop OR
+# down in ctr2sen & up in sen2repop
+keep_cfs1 <- c(which(grepl("control2senescent", names(signif_diff)) & 
+                    grepl("MCF7|T47D|MDA-MB-231|Hs578T", names(signif_diff)) &
+                    grepl("up", names(signif_diff))),
+              which(grepl("senescent2repopulated", names(signif_diff)) & 
+                    grepl("MCF7|T47D|MDA-MB-231|Hs578T", names(signif_diff)) &
+                    grepl("down", names(signif_diff))))
+keep_genes1 <- Reduce(intersect, signif_diff[keep_cfs1])
+keep_cfs2 <- c(which(grepl("control2senescent", names(signif_diff)) & 
+                    grepl("MCF7|T47D|MDA-MB-231|Hs578T", names(signif_diff)) &
+                    grepl("down", names(signif_diff))),
+              which(grepl("senescent2repopulated", names(signif_diff)) & 
+                    grepl("MCF7|T47D|MDA-MB-231|Hs578T", names(signif_diff)) &
+                    grepl("up", names(signif_diff))))
+keep_genes2 <- Reduce(intersect, signif_diff[keep_cfs2])
+keep_genes <- c(keep_genes1, keep_genes2)
+
+# now select these genes and plot
+keep_rows <- which(exprmx$GeneID %in% keep_genes)
+keep_cols <- which(grepl("MCF7|T47D|231|Hs", colnames(exprmx)))
+plot_logexpr <- as.matrix(exprmx[keep_rows, keep_cols])
+# sort by order in hierarchical clustering
+horder <- hclust(dist(plot_logexpr))
+plot_logexpr <- plot_logexpr[horder$order,]
+# order columns by cell & treatment
+plot_cell <- samples_annot$cell[match(colnames(plot_logexpr), 
+                                             samples_annot$sample_full)]
+plot_cell <- factor(plot_cell, levels=unique(plot_cell))
+plot_treatment <- samples_annot$treatment[match(colnames(plot_logexpr), 
+                                             samples_annot$sample_full)]
+plot_treatment <- factor(plot_treatment, levels=c("control", "senescent", "repopulated"))
+plot_rep <- strsplit2(colnames(plot_logexpr), split=" ")[, 3]
+colnames(plot_logexpr) <- paste(plot_cell, plot_treatment, plot_rep, sep=" ")
+# order by cell & treatment first
+plot_logexpr <- plot_logexpr[, order(plot_cell, plot_treatment, plot_rep)]
+plot_cell <- plot_cell[order(plot_cell, plot_treatment, plot_rep)] # this will be used for the plot
+
+# draw heatmap
+# 1) expression of each gene is centered and scaled
+mat_scaled = t(apply(plot_logexpr, 1, scale, scale=T))
+ctype = gsub("s\\d+_", "", colnames(plot_logexpr))
+colnames(mat_scaled) <- ctype
+# change names as required
+for (ci in 1:ncol(mat_scaled)){
+  colnames(mat_scaled)[ci] <- gsub("control", "CTR", colnames(mat_scaled)[ci])
+  colnames(mat_scaled)[ci] <- gsub("senescent", "TIS", colnames(mat_scaled)[ci])
+  colnames(mat_scaled)[ci] <- gsub("repopulated", "REPOP", colnames(mat_scaled)[ci])
+}
+rownames(mat_scaled) <- NULL
+#cell_names <- strsplit2(colnames(mat_scaled), split=" ")[,1]
+
+ht_list = Heatmap(mat_scaled, name = "scaled logexpr", row_km = 1, 
+                  show_heatmap_legend = F,
+                  gap=unit(0, 'inch'), border=T,
+                  #column_split = factor(cell_names, levels=unique(cell_names)),
+                  column_split = plot_cell,
+                  col = colorRamp2(c(-2, 0, 2), c("blue", "white", "red")),
+                  #top_annotation = ha, 
+                  show_column_names = T, show_column_dend = F,
+                  row_title = NULL,  show_row_dend = FALSE,
+                  cluster_rows=F, cluster_columns=F,
+                  row_dend_reorder=F, column_dend_reorder = F)
+                 #  width=unit(10, "cm"), height=unit(20, "cm"))
+
+figfile <- file.path(figfolder, "logexpr_intersection_malignant_heatmap.pdf")
+save_pdf(ht_list, figfile, width=7, height=7, units="in")
+```
+
+
+Plot heatmap of genes that can be implicated in resistance (Figure 4O).
+```{r plot heatmap for 'resistance' genes}
+selected_genes <- c("ABCB1","ABCC1","ABCC3","ABCG2","BCL2","BTK","CDK1","CDK2",
+                   "CDK4","CDK5","CDK7","CDK9","DCK","DNMT1","DNMT3A","DNMT3B",
+                   "EGFR","FDPS","FGFR1","FLT3","IDH2","MDM2","NEDD8","PDGFRA",
+                   "PLK1","PSMB5","RRM1","RRM2","RRM2B","SAMHD1","TOP2A","XPO1")
+
+keep_genes <- genes_annot$Gene_ID[match(selected_genes,
+                                     genes_annot$name)]
+omit <- which(is.na(match(selected_genes,genes_annot$name)))
+if (length(omit)>0) keep_genes <- keep_genes[-omit]
+
+# now select these genes and plot
+keep_rows <- match(keep_genes, exprmx$GeneID)
+krownames <- genes_annot$name[match(keep_genes, genes_annot$Gene_ID)]
+keep_cols <- which(grepl("MCF7|T47D|231|Hs", colnames(exprmx)))
+# keep_cols <- which(grepl("MCF7|T47D", colnames(exprmx)))
+plot_logexpr <- as.matrix(exprmx[keep_rows, keep_cols])
+rownames(plot_logexpr) <- krownames
+# order columns by cell & treatment
+plot_cell <- samples_annot$cell[match(colnames(plot_logexpr), 
+                                             samples_annot$sample_full)]
+plot_cell <- factor(plot_cell, levels=unique(plot_cell))
+plot_treatment <- samples_annot$treatment[match(colnames(plot_logexpr), 
+                                             samples_annot$sample_full)]
+plot_treatment <- factor(plot_treatment, levels=c("control", "senescent", "repopulated"))
+plot_rep <- strsplit2(colnames(plot_logexpr), split=" ")[, 3]
+colnames(plot_logexpr) <- paste(plot_cell, plot_treatment, plot_rep, sep=" ")
+
+# order by cell & treatment first
+plot_logexpr <- plot_logexpr[, order(plot_cell, plot_treatment, plot_rep)]
+plot_cell <- plot_cell[order(plot_cell, plot_treatment, plot_rep)] # this will be used for the plot
+
+# draw heatmap
+# 1) expression of each gene is centered, but not scaled
+mat_scaled = t(apply(plot_logexpr, 1, scale, scale=T))
+# mat_scaled = plot_logexpr
+ctype = gsub("s\\d+_", "", colnames(plot_logexpr))
+colnames(mat_scaled) <- ctype
+#cell_names <- strsplit2(colnames(mat_scaled), split=" ")[,1]
+
+# save the heatmap for the mean values
+mean_scaled <- as_tibble(mat_scaled)
+tmp_list <- list()
+for (cell in unique(plot_cell)){
+  tmp_list[[cell]] <- mean_scaled[, which(plot_cell==cell)]
+  tmp_list[[cell]] <- tmp_list[[cell]] %>%
+        transmute(
+        control = rowMeans(select(., matches("control"))),
+        senescent = rowMeans(select(., matches("senescent"))),
+        repopulated = rowMeans(select(., matches("repopulated")))
+    ) 
+  colnames(tmp_list[[cell]]) <- paste(cell, 
+                                      colnames(tmp_list[[cell]]), sep='_')
+}
+mean_scaled <- do.call(bind_cols, tmp_list)
+plot_cell_new <- strsplit2(colnames(mean_scaled), split='_')[,1]
+plot_cell_new <- factor(plot_cell_new, levels=unique(plot_cell_new))
+mean_scaled <- as.matrix(mean_scaled)
+rownames(mean_scaled) <- rownames(mat_scaled)
+# replace column names
+colnames(mean_scaled) <- strsplit2(colnames(mean_scaled), split='_')[,2]
+for (ci in 1:ncol(mean_scaled)){
+  colnames(mean_scaled)[ci] <- gsub("control", "CTR", colnames(mean_scaled)[ci])
+  colnames(mean_scaled)[ci] <- gsub("senescent", "TIS", colnames(mean_scaled)[ci])
+  colnames(mean_scaled)[ci] <- gsub("repopulated", "REPOP", colnames(mean_scaled)[ci])
+}
+
+# plot rotated
+mean_scaled_rot <- t(mean_scaled)
+# 
+# ht_list = Heatmap(mean_scaled_rot, name = "mean scaled logexpr", column_km = 1, 
+#                   show_heatmap_legend = F,
+#                   gap=unit(0.04, 'inch'), 
+#                   column_names_gp = grid::gpar(fontsize = 6),
+#                   row_names_gp = grid::gpar(fontsize = 6),
+#                   row_title_gp = grid::gpar(fontsize = 8),
+#                   # border=T,
+#                   row_split = plot_cell_new, row_title_rot = 0,
+#                   col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+#                   #top_annotation = ha, 
+#                   show_row_names = T, show_row_dend = F,
+#                   column_title = NULL,  show_column_dend = F,
+#                   cluster_rows=F, cluster_columns=F,
+#                   row_dend_reorder=F, column_dend_reorder = F)
+#                  #  width=unit(10, "cm"), height=unit(20, "cm"))
+# figfile <- file.path(figfolder, "mean_logexpr_selected_genes_heatmap_rotated_alphabetical_order.pdf")
+# save_pdf(ht_list, figfile, width=8.4, height=2.5, units="in")
+
+# plot seperately for each cell line
+mean_scaled_rot_list <- list()
+grob_list <- list()
+for (cname in unique(plot_cell_new)){
+  ci <- match(cname, unique(plot_cell_new))
+  fi <- (ci-1)*3+1
+  li <- 3*ci
+  mean_scaled_rot_list[[cname]] <- mean_scaled_rot[fi:li,]
+  # order by TIS
+  mean_scaled_rot_list[[cname]] <- mean_scaled_rot_list[[cname]][, 
+              order(mean_scaled_rot_list[[cname]][2,])]
+  # draw
+  ht_list <- Heatmap(mean_scaled_rot_list[[cname]], name = "mean scaled logexpr", 
+                  column_km = 1, 
+                  show_heatmap_legend = F,
+                  gap=unit(0.04, 'inch'), 
+                  column_names_gp = grid::gpar(fontsize = 6),
+                  row_names_gp = grid::gpar(fontsize = 6),
+                  row_title_gp = grid::gpar(fontsize = 8),
+                  # border=T,
+                  # row_split = plot_cell_new[fi:li], row_title_rot = 0,
+                  col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+                  #top_annotation = ha, 
+                  show_row_names = T, show_row_dend = F,
+                  column_names_rot = 45, # turn to the left a bit
+                  #column_names_rot = 105,
+                  #column_names_rot = 90,
+                  column_title = NULL,  show_column_dend = F,
+                  cluster_rows=F, cluster_columns=F,
+                  row_dend_reorder=F, column_dend_reorder = F)
+  
+  # create a grop
+  grob_list[[cname]] <- grid::grid.grabExpr(draw(ht_list))
+}
+
+xoff <- 0.5 # relative x position of label, within one plot
+yoff <- 1 # relative y position of label, within one plot
+p <- cowplot::plot_grid(plotlist=grob_list, nrow=4)+
+         cowplot::draw_plot_label(label=names(grob_list),
+                            x=rep(xoff, 4),
+                            y=1-(1-yoff+0:3)/4,
+                            hjust=.5, vjust=.5, size=8,
+                            fontface="plain")+
+  theme(
+    # add margin on the top (first) and left (last)
+    plot.margin = margin(5, 0, 0, 5)
+  )
+plot(p)
+figfile <- file.path(figfolder,
+           paste("mean_logexpr_selected_genes_heatmap_rotated_",
+                    "seperately", ".tiff", sep=""))
+#ggsave(figfile, plot=p, width=12.4, height=3.5, device='tiff', dpi=300, bg="white")
+ggsave(gsub(".tiff", ".pdf", figfile, fixed=T),
+       plot=p, width=12.4, height=3.5)
+
+```
+
+
+Expression profile of 95 genes coding the proteins found to be overexpressed exclusively on the surface of TIS cells (Supplementary Figure S9A)
+```{r plot heatmap for proteomics genes}
+excelfile <- file.path(datafolder, "Proteomics/sens_over_95.xlsx")
+tusi_data <- readxl::read_excel(excelfile)
+selected_genes <- tusi_data$Gene
+
+keep_genes <- genes_annot$Gene_ID[match(selected_genes,
+                                     genes_annot$name)]
+omit <- which(is.na(match(selected_genes,genes_annot$name)))
+if (length(omit)>0) keep_genes <- keep_genes[-omit]
+
+# now select these genes and plot
+keep_rows <- match(keep_genes, exprmx$GeneID)
+krownames <- genes_annot$name[match(keep_genes, genes_annot$Gene_ID)]
+keep_cols <- which(grepl("MCF7|T47D|231|Hs", colnames(exprmx)))
+# keep_cols <- which(grepl("MCF7|T47D", colnames(exprmx)))
+plot_logexpr <- as.matrix(exprmx[keep_rows, keep_cols])
+rownames(plot_logexpr) <- krownames
+# # sort by order in hierarchical clustering
+# horder <- hclust(dist(plot_logexpr))
+# plot_logexpr <- plot_logexpr[horder$order,]
+# order columns by cell & treatment
+plot_cell <- samples_annot$cell[match(colnames(plot_logexpr), 
+                                             samples_annot$sample_full)]
+plot_cell <- factor(plot_cell, levels=unique(plot_cell))
+plot_treatment <- samples_annot$treatment[match(colnames(plot_logexpr), 
+                                             samples_annot$sample_full)]
+plot_treatment <- factor(plot_treatment, levels=c("control", "senescent", "repopulated"))
+# plot_cell <- strsplit2(colnames(plot_logexpr), split=" ")[, 1]
+# plot_treatment <- strsplit2(colnames(plot_logexpr), split=" ")[, 2]
+# plot_treatment <- factor(plot_treatment, levels=c("ctr", "12.nap", "vissza"))
+plot_rep <- strsplit2(colnames(plot_logexpr), split=" ")[, 3]
+colnames(plot_logexpr) <- paste(plot_cell, plot_treatment, plot_rep, sep=" ")
+# order by cell & treatment first
+plot_logexpr <- plot_logexpr[, order(plot_cell, plot_treatment, plot_rep)]
+plot_cell <- plot_cell[order(plot_cell, plot_treatment, plot_rep)] # this will be used for the plot
+
+# draw heatmap
+# 1) expression of each gene is centered, but not scaled
+mat_scaled = t(apply(plot_logexpr, 1, scale, scale=T))
+# mat_scaled = plot_logexpr
+ctype = gsub("s\\d+_", "", colnames(plot_logexpr))
+colnames(mat_scaled) <- ctype
+#cell_names <- strsplit2(colnames(mat_scaled), split=" ")[,1]
+
+# save the heatmap for the mean values
+mean_scaled <- as_tibble(mat_scaled)
+tmp_list <- list()
+for (cell in unique(plot_cell)){
+  tmp_list[[cell]] <- mean_scaled[, which(plot_cell==cell)]
+  tmp_list[[cell]] <- tmp_list[[cell]] %>%
+        transmute(
+        # control = rowMeans(select(., matches("ctr"))),
+        # senescent = rowMeans(select(., matches("12.nap"))),
+        # repopulated = rowMeans(select(., matches("vissza")))
+        control = rowMeans(select(., matches("control"))),
+        senescent = rowMeans(select(., matches("senescent"))),
+        repopulated = rowMeans(select(., matches("repopulated")))
+    ) 
+  colnames(tmp_list[[cell]]) <- paste(cell, 
+                                      colnames(tmp_list[[cell]]), sep='_')
+}
+mean_scaled <- do.call(bind_cols, tmp_list)
+plot_cell_new <- strsplit2(colnames(mean_scaled), split='_')[,1]
+plot_cell_new <- factor(plot_cell_new, levels=unique(plot_cell_new))
+mean_scaled <- as.matrix(mean_scaled)
+rownames(mean_scaled) <- rownames(mat_scaled)
+# replace column names
+colnames(mean_scaled) <- strsplit2(colnames(mean_scaled), split='_')[,2]
+for (ci in 1:ncol(mean_scaled)){
+  colnames(mean_scaled)[ci] <- gsub("control", "CTR", colnames(mean_scaled)[ci])
+  colnames(mean_scaled)[ci] <- gsub("senescent", "TIS", colnames(mean_scaled)[ci])
+  colnames(mean_scaled)[ci] <- gsub("repopulated", "REPOP", colnames(mean_scaled)[ci])
+}
+
+# plot seperately for each cell line
+# plot seperately for each cell line
+mean_scaled_list <- list()
+grob_list <- list()
+for (cname in unique(plot_cell_new)){
+  ci <- match(cname, unique(plot_cell_new))
+  fi <- (ci-1)*3+1
+  li <- 3*ci
+  mean_scaled_list[[cname]] <- mean_scaled[,fi:li]
+  # order by TIS
+  mean_scaled_list[[cname]] <- mean_scaled_list[[cname]][
+              order(mean_scaled_list[[cname]][,2], decreasing=T),]
+  # draw
+  ht_list <- Heatmap(mean_scaled_list[[cname]], name = "mean scaled logexpr", 
+                  column_km = 1, 
+                  show_heatmap_legend = F,
+                  gap=unit(0.04, 'inch'), 
+                  column_names_gp = grid::gpar(fontsize = 6),
+                  row_names_gp = grid::gpar(fontsize = 6),
+                  row_title_gp = grid::gpar(fontsize = 8),
+                  # border=T,
+                  # row_split = plot_cell_new[fi:li], row_title_rot = 0,
+                  col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+                  #top_annotation = ha, 
+                  show_row_names = T, show_row_dend = F,
+                  column_names_rot = 45, # turn to the left a bit
+                  #column_names_rot = 105,
+                  #column_names_rot = 90,
+                  column_title = NULL,  show_column_dend = F,
+                  cluster_rows=F, cluster_columns=F,
+                  row_dend_reorder=F, column_dend_reorder = F)
+   # create a grop
+  grob_list[[cname]] <- grid::grid.grabExpr(draw(ht_list))
+}
+
+xoff <- 0.125 # relative x position of label, within one plot
+yoff <- 1 # relative y position of label, within one plot
+p <- cowplot::plot_grid(plotlist=grob_list, ncol=4)+
+         cowplot::draw_plot_label(label=names(grob_list),
+                            #x=rep(xoff, 4),
+                            #y=1-(1-yoff+0:3)/4,
+                            #hjust=.5, vjust=.5,
+                            x=xoff+(0:3)/4,
+                            y=yoff,
+                            hjust=0.5, vjust=0.5,
+                            size=8,
+                            fontface="plain")+
+  theme(
+    # add margin on the top (first) and left (last)
+    plot.margin = margin(5, 0, 0, 0)
+  )
+
+figfile <- file.path(figfolder,
+            paste("mean_logexpr_proteomics_genes_heatmap_",
+                    "seperately", ".tiff", sep=""))
+#ggsave(figfile, plot=p, width=7, height=12, device='tiff', dpi=300, bg="white")
+ggsave(gsub(".tiff", ".pdf", figfile, fixed=T),
+       plot=p, width=7, height=12)
+
+# plot rotated #
+
+mean_scaled_rot <- t(mean_scaled)
+# plot seperately for each cell line
+mean_scaled_rot_list <- list()
+grob_list <- list()
+for (cname in unique(plot_cell_new)){
+  ci <- match(cname, unique(plot_cell_new))
+  fi <- (ci-1)*3+1
+  li <- 3*ci
+  mean_scaled_rot_list[[cname]] <- mean_scaled_rot[fi:li,]
+  # order by TIS
+  mean_scaled_rot_list[[cname]] <- mean_scaled_rot_list[[cname]][, 
+              order(mean_scaled_rot_list[[cname]][2,])]
+  # draw
+  ht_list <- Heatmap(mean_scaled_rot_list[[cname]], name = "mean scaled logexpr", 
+                  column_km = 1, 
+                  show_heatmap_legend = F,
+                  gap=unit(0.04, 'inch'), 
+                  column_names_gp = grid::gpar(fontsize = 6),
+                  row_names_gp = grid::gpar(fontsize = 6),
+                  row_title_gp = grid::gpar(fontsize = 8),
+                  # border=T,
+                  # row_split = plot_cell_new[fi:li], row_title_rot = 0,
+                  col = colorRamp2(c(-1, 0, 1), c("blue", "white", "red")),
+                  #top_annotation = ha, 
+                  show_row_names = T, show_row_dend = F,
+                  column_names_rot = 45, # turn to the left a bit
+                  #column_names_rot = 105,
+                  #column_names_rot = 90,
+                  column_title = NULL,  show_column_dend = F,
+                  cluster_rows=F, cluster_columns=F,
+                  row_dend_reorder=F, column_dend_reorder = F)
+  
+  # create a grop
+  grob_list[[cname]] <- grid::grid.grabExpr(draw(ht_list))
+}
+
+xoff <- 0.5 # relative x position of label, within one plot
+yoff <- 1 # relative y position of label, within one plot
+p <- cowplot::plot_grid(plotlist=grob_list, nrow=4)+
+         cowplot::draw_plot_label(label=names(grob_list),
+                            x=rep(xoff, 4),
+                            y=1-(1-yoff+0:3)/4,
+                            hjust=.5, vjust=.5, size=8,
+                            fontface="plain")+
+  theme(
+    # add margin on the top (first) and left (last)
+    plot.margin = margin(5, 0, 0, 7)
+  )
+
+figfile <- file.path(figfolder,
+            paste("mean_logexpr_proteomics_genes_heatmap_rotated_",
+                    "seperately", ".tiff", sep=""))
+# ggsave(figfile, plot=p, width=12.4, height=3.5, device='tiff', dpi=300, bg="white")
+ggsave(gsub(".tiff", ".pdf", figfile, fixed=T),
+       plot=p, width=12.4, height=3.5)
+```
+
+Heatmap of proteins overexpressed only in TIS cells (Figure 6I).
+Read in proteomics data file as input.
+```{r plot heatmap of proteomics}
+excelfile <- file.path(datafolder, "Proteomics/sens_over_95.xlsx")
+tusi_data <- readxl::read_excel(excelfile)
+colnames(tusi_data) <- c("Gene",	"TM",	"CTR", "TIS", "REPOP",	"Diff")
+# plot 
+tusi_mx <- as.matrix(tusi_data[, c("CTR", "TIS", "REPOP")])
+rownames(tusi_mx) <- tusi_data$Gene
+# order by TIS
+tusi_mx <- tusi_mx[order(tusi_mx[, "TIS"]),]
+
+# draw
+for (direction in c("orig", "rotated")){
+  tusi_plot <- tusi_mx
+  if (direction=="rotated") tusi_plot <- t(tusi_mx)
+  ht_list <- Heatmap(tusi_plot, name = "protein expression", 
+                column_km = 1, 
+                show_heatmap_legend = F,
+                gap=unit(0.04, 'inch'), 
+                column_names_gp = grid::gpar(fontsize = 6),
+                row_names_gp = grid::gpar(fontsize = 6),
+                row_title_gp = grid::gpar(fontsize = 8),
+                # border=T,
+                # row_split = plot_cell_new[fi:li], row_title_rot = 0,
+                col = colorRamp2(c(min(tusi_mx), 
+                                   min(tusi_mx)+(max(tusi_mx)-min(tusi_mx))/2, 
+                                    max(tusi_mx)), 
+                                 c("blue", "white", "red")),
+                #top_annotation = ha, 
+                show_row_names = T, show_row_dend = F,
+                column_names_rot = 45, # turn to the left a bit
+                #column_names_rot = 105,
+                #column_names_rot = 90,
+                column_title = NULL,  show_column_dend = F,
+                cluster_rows=F, cluster_columns=F,
+                row_dend_reorder=F, column_dend_reorder = F)
+  if (direction == "rotated"){
+  p <-  grid::grid.grabExpr(draw(ht_list, padding = unit(c(0, 0.2, 0, 0), "in")))
+  } else  {
+    p <-  grid::grid.grabExpr(draw(ht_list))
+  }
+  
+  figfile <- file.path(figfolder,
+              paste("protexpr_heatmap_", direction, ".tiff", sep=""))
+  if (direction=="rotated"){
+    # ggsave(figfile, plot=p, width=12.4, height=1, device='tiff', dpi=300, bg="white")
+    ggsave(gsub(".tiff", ".pdf", figfile, fixed=T), plot=p, width=12.4, height=1)
+  } else {
+    # ggsave(figfile, plot=p, width=1, height=12.4, device='tiff', dpi=300, bg="white")
+    ggsave(gsub(".tiff", ".pdf", figfile, fixed=T), plot=p, width=1, height=12.4)
+  }
+}
+
+```
+
+Expression levels of the top five genes with available inhibitors in CTR (red), TIS (green) and REPOP (blue) cells (Figure 6A)
+```{r nice figures for the selected 5 genes}
+gene5 <- c("KRT6A", "PSMA8", "PDE1A", "ACSM2A", "GSDMC")
+gene5_annot <- genes_annot[match(gene5, genes_annot$name),]
+cell_annot <- cbind(c("MCF7", "T47D", "231", "Hs"),
+                    c("MCF7", "T47D", "MDA-MB-231", "Hs578T"))
+colnames(cell_annot) <- c("orig", "nice")
+cell_annot <- as_tibble(cell_annot)
+# try boxplot first
+keep_cols <- which(grepl("MCF7|T47D|231|Hs", colnames(exprmx)))
+exprmx5 <- exprmx[match(gene5_annot$Gene_ID, exprmx$GeneID), 
+                    c(1, keep_cols)]
+# convert to long format
+exprmx5_long <- pivot_longer(exprmx5, !GeneID,
+                            names_to = "sample", 
+                            values_to = "gene_expr")
+
+exprmx5_long$GeneName <- gene5_annot$name[
+                            match(exprmx5_long$GeneID, gene5_annot$Gene_ID)]
+exprmx5_long$cell <- strsplit2(exprmx5_long$sample, split = " ")[,1]
+exprmx5_long$cell <- cell_annot$nice[match(exprmx5_long$cell, cell_annot$orig)]
+exprmx5_long$trt <- strsplit2(exprmx5_long$sample, split = " ")[,2]
+exprmx5_long$trt <- gsub("ctr", "CTR", exprmx5_long$trt )
+exprmx5_long$trt <- gsub("12.nap", "TIS", exprmx5_long$trt )
+exprmx5_long$trt <- gsub("vissza", "REPOP", exprmx5_long$trt )
+exprmx5_long$trt <- factor(exprmx5_long$trt, 
+                              levels=c("CTR", "TIS", "REPOP"))
+
+p <- ggplot(data=exprmx5_long, 
+            aes(x=cell, y=gene_expr, fill=trt))+
+          geom_violin(bw=0.3, trim=F)+
+          facet_wrap(~GeneName, nrow=1) +
+          ylab("Gene expression") + xlab("")+
+          guides(fill=guide_legend(title="Treatment"))+
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+figfile <- file.path(figfolder, "Gene5_expression.pdf")
+ggsave(figfile, plot=p, width=14, height=2.5)
+
+# # shift the legend - not needed any more with figures all in one row
+# shift_legend3 <- function(p) {
+#     pnls <- cowplot::plot_to_gtable(p) %>% gtable::gtable_filter("panel") %>%
+#       with(setNames(grobs, layout$name)) %>% purrr::keep(~identical(.x,zeroGrob()))
+# 
+#     if( length(pnls) == 0 ) stop( "No empty facets in the plot" )
+# 
+#     lemon::reposition_legend( p, "center", panel=names(pnls) )
+# }
+# p2 <- shift_legend3(p)
+# ggsave(figfile, plot=p2, width=7, height=5)
+
+```
+
+Volcano plot for HFF (Supplementary Figure S3)
+```{r HFF volcano plot}
+# needs to be added later: highlight some genes
+toptt_HFF <- topTable(fite, coef="control2senescent_HFF",  
+            number=nrow(fite$coefficients), sort.by = "none")
+
+    # add whether it was differentially expressed
+toptt_HFF$diffexpressed <- "NO"
+toptt_HFF$diffexpressed[toptt_HFF$logFC > lthr  & toptt_HFF$adj.P.Val < pthr ] <- "UP"
+toptt_HFF$diffexpressed[toptt_HFF$logFC < -lthr  & toptt_HFF$adj.P.Val < pthr ] <- "DOWN"
+toptt_HFF$diffexpressed <- factor(toptt_HFF$diffexpressed, levels=c("NO", "UP", "DOWN"))
+
+# add text for selected & top genes
+selected_genes <- c("ABCC1", "ABCC3", "ABCG2", "CDK1", "CDK2", "CDK4", "CDK5", 
+    "CDK7", "CDK9", "DNMT1", "DNMT3A", "DNMT3B", "DCK", "FGFR1", "KIT", "PDGFRA", 
+    "RRM1", "RRM2", "RRM2B", "SAMHD1","FLT1", "FDPS", "XPO1", "IDH1", "IDH2", "BCL2", "PLK1",
+    "TOP2A", "NEDD8", "MDM2", "ABCB1", "BTK", "EGFR", "FLT3", "FTO", "PSMB5")
+keep_genes <- genes_annot$Gene_ID[match(selected_genes, 
+                                 genes_annot$name)]
+keep_ind <- match(keep_genes, rownames(toptt_HFF))
+# also the "large" differential expression ones
+lfc_spec <- 5
+adjp_spec <- 10
+large_genes_ind <- which(abs(toptt_HFF$logFC)>=lfc_spec |
+                       -log10(toptt_HFF$adj.P.Val)>=10)
+large_genes_names <- genes_annot$name[
+          match(rownames(toptt_HFF)[large_genes_ind], genes_annot$Gene_ID)]
+# replace none with the gene id
+for (gi in which(large_genes_names=="None")){
+  large_genes_names[gi] <- rownames(toptt_HFF)[large_genes_ind][gi]
+}
+# create a small dataframe with the labels
+text_df <- toptt_HFF[c(keep_ind, large_genes_ind), ]
+text_df$gene_name <- c(selected_genes, large_genes_names)
+
+
+# p <- ggplot(data=toptt_HFF, aes(x=logFC, y=-log10(adj.P.Val), 
+#                                  col=diffexpressed)) +
+p <- ggplot(data=text_df, aes(x=logFC, y=-log10(adj.P.Val), 
+                                 col=diffexpressed)) +
+              geom_point() + 
+              theme_minimal() +
+              scale_color_manual(name="differentially\n expressed",
+                values=c("DOWN"="blue", "NO"="gray", "UP"="red")) +
+              geom_vline(xintercept=c(-lthr, lthr), col="black", linetype="dashed") +
+              geom_hline(yintercept=-log10(pthr), col="black", linetype="dashed")+
+              geom_text(data=text_df, aes(x=logFC, y=-log10(adj.P.Val),
+                                          label=gene_name), color="black",
+                         size=2, nudge_y = 0.5)+
+              theme_gray(base_size = 20)+
+              xlab(bquote(Log[2] * bgroup("(", "Fold Change", ")" )))+
+              ylab(bquote(-Log[10] * bgroup("(", "adjusted P value", ")" )))
+outfig <- file.path(figfolder, "volcano_geneset_HFF_labels_only.pdf")
+ggsave(p, file=outfig, width=8, height=5)
+
+# create a small dataframe with the labels of "large" genes only
+text_df <- toptt_HFF[c(large_genes_ind), ]
+text_df$gene_name <- c(large_genes_names)
+
+
+outtext <- left_join(as_tibble(toptt_HFF, rownames="gene_ID"),
+                        as_tibble(text_df, rownames="gene_ID")[, c("gene_ID", "gene_name")], 
+                         by="gene_ID")
+# sort so that annotated is at top
+outtext <- outtext[order(outtext$gene_name),]
+# # write to file
+outfile <- file.path(resfolder, "HFF_diffexpr.csv")
+write_csv(outtext, file=outfile)
+
+p <- ggplot(data=toptt_HFF, aes(x=logFC, y=-log10(adj.P.Val),
+                                 col=diffexpressed)) +
+              geom_point(alpha = 0.5) + 
+              theme_minimal() +
+              scale_color_manual(name="differentially\n expressed",
+                values=c("DOWN"="blue", "NO"="gray", "UP"="red")) +
+              geom_vline(xintercept=c(-lthr, lthr), col="black", linetype="dashed") +
+              geom_hline(yintercept=-log10(pthr), col="black", linetype="dashed")+
+              geom_text_repel(data=text_df, aes(x=logFC, y=-log10(adj.P.Val),
+                                          label=gene_name), color="black",
+                         size=2, max.overlaps = 20)+
+              # theme_gray(base_size = 20)+
+              xlab(bquote(Log[2] * bgroup("(", "Fold Change", ")" )))+
+              ylab(bquote(-Log[10] * bgroup("(", "adjusted P value", ")" )))
+outfig <- file.path(figfolder, "volcano_geneset_HFF.pdf")
+ggsave(p, file=outfig, width=8, height=5)
+
+```
+
+PCA analysis of CTR and TIS HFF cells (Supplementary Figure S3C)
+```{r PCA analysis including and highlighting the HFF samples}
+# repeat the pca analysis
+keep_cols <- which(grepl("MCF7|T47D|231|Hs", colnames(exprmx)))
+indata_mx <- as.matrix(exprmx[,keep_cols])
+pca <- prcomp(t(indata_mx), center=TRUE, scale=FALSE,
+              tol = sqrt(.Machine$double.eps), rank.=30)
+# use the same transformation, but add the HFF samples as well
+keep_HFF <- which(grepl("HFF", colnames(exprmx)))
+newdata_mx <- as.matrix(exprmx[,keep_HFF])
+pca_HFF <-  predict(pca, t(newdata_mx))
+pca_HFF  <- as_tibble(pca_HFF, rownames="sample")
+# new add the previous results as well
+pca_all <- bind_rows(pca_res, pca_HFF)
+# add annotation as well
+pca_annot <- inner_join(pca_all, samples_annot, by=c("sample"="sample_full"))
+pca_annot$treatment <- factor(pca_annot$treatment, levels=treat_order)
+
+nicexlabel <- paste('PC1 (', as.character(vardf$variance[1]), '%)', sep="")
+niceylabel <- paste('PC2 (', as.character(vardf$variance[2]), '%)', sep="")
+nicezlabel <- paste('PC3 (', as.character(vardf$variance[3]), '%)', sep="")
+
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, 
+                         col = cell, shape = treatment), 
+             size = 3, stroke = 2, fill="white")+
+  scale_shape_manual(values = c(21,22,23),
+                      labels=c("CTR", "TIS", "REPOP"))+
+  scale_color_manual(values=c("MCF7"="red", "T47D"="orange", 
+                              "MDA-MB-231"="darkblue", "Hs578T"="darkgreen",
+                               "HFF"="black"))+
+   labs(x = nicexlabel, y = niceylabel)+
+   #xlim(c(-140,-125)) + ylim(c(-40,-60))+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+
+inset <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, 
+                         col = cell, shape = treatment), 
+             size = 2, stroke = 2, fill="white")+
+  scale_shape_manual(values = c(21,22,23),
+                      labels=c("CTR", "TIS", "REPOP"))+
+  scale_color_manual(values=c("MCF7"="red", "T47D"="orange", 
+                              "MDA-MB-231"="darkblue", "Hs578T"="darkgreen",
+                               "HFF"="black"))+
+   labs(x = nicexlabel, y = niceylabel)+
+   xlim(c(-140,-125)) + ylim(c(-60, -40))+
+   guides(col="none", shape="none")+
+   theme(axis.title=element_blank(),
+        axis.text=element_blank(),
+        axis.ticks=element_blank())
+  #theme_gray(base_size = 20) # change the default font size in the grey theme 
+
+pfinal <- p +
+  # add an inset
+  annotation_custom(
+    ggplotGrob(inset),
+    xmin = 80, xmax = 200, ymin = 100, ymax = 200
+  )
+
+p <- ggplot(data=pca_annot) +
+  geom_point(mapping=aes(x = PC1, y = PC2, 
+                         col = cell, shape = treatment), 
+             size = 3, stroke = 2, fill="white")+
+  scale_shape_manual(values = c(21,22,23),
+                      labels=c("CTR", "TIS", "REPOP"))+
+  scale_color_manual(values=c("MCF7"="red", "T47D"="orange", 
+                              "MDA-MB-231"="darkblue", "Hs578T"="darkgreen",
+                               "HFF"="black"))+
+   labs(x = nicexlabel, y = niceylabel)+
+   #xlim(c(-140,-125)) + ylim(c(-40,-60))+
+  theme_gray(base_size = 20) # change the default font size in the grey theme
+
+# use magnification instead
+from <- c(xmin = -145, xmax = -125, ymin = -60, ymax = -40)
+# Names xmin, xmax, ymin, ymax are optional:
+to <- c(xmin=80, xmax=200, ymin=100, ymax=200)
+
+pfinal <- p + geom_magnify(from = from, to = to)
+
+resfile <- file.path(figfolder, "HFF_PCA_samples_PC1_vs_PC2.pdf")
+ggsave(resfile, plot=pfinal, width=7, height=5)
+```
+
+
+
+<!-- ```{r test ggmagnify} -->
+<!-- library(ggplot2) -->
+<!-- library(ggmagnify) -->
+
+<!-- dv <- as_tibble(cbind("Position"=c(1:10), "NegLogP"=sample(c(11:20)))) -->
+<!-- ggp <- ggplot(dv, aes(Position, NegLogP)) +  -->
+<!--   geom_point() + -->
+<!--   labs(title = "GWAS p-values for cognitive function", -->
+<!--        subtitle = "Davies et al. (2018).", y = "-log(p)") -->
+
+<!-- from <- c(xmin = 0.5, xmax = 0.6, ymin = 12, ymax = 14) -->
+<!-- # Names xmin, xmax, ymin, ymax are optional: -->
+<!-- to <- c(0.7, 0.9, 18,20) -->
+
+<!-- pfinal <- ggp + geom_magnify(from = from, to = to) -->
+<!-- resfile <- file.path(figfolder, "HFF_PCA_samples_PC1_vs_PC2.pdf") -->
+<!-- ggsave(resfile, plot=pfinal, width=7, height=5) -->
+<!-- ``` -->
+
