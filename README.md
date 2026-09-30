@@ -1,4 +1,4 @@
-# Tks4analysis
+# TIS analysis
 
 ## Purpose
 The objective of this R Markdown code is to reproduce bulk RNA-seq analysis in the publication Bajtai et al.
